@@ -37,6 +37,10 @@ from libp2p.utils import (
     read_varint_prefixed_bytes,
 )
 
+from libp2p.tools.async_service import (
+    Service,
+)
+
 from .constants import (
     HeaderTags,
 )
@@ -57,7 +61,7 @@ MPLEX_MESSAGE_CHANNEL_SIZE = 8
 logger = logging.getLogger(__name__)
 
 
-class Mplex(IMuxedConn):
+class Mplex(Service, IMuxedConn):
     """
     reference: https://github.com/libp2p/go-mplex/blob/master/multiplex.go
     """
@@ -107,8 +111,18 @@ class Mplex(IMuxedConn):
         self.event_started = trio.Event()
         self.on_close = on_close
 
+    async def run(self) -> None:
+        self.event_started.set()
+        try:
+            while True:
+                await self._handle_incoming_message()
+        except MplexUnavailable as e:
+            logger.debug("mplex unavailable while waiting for incoming: %s", e)
+        finally:
+            await self._cleanup()
+
     async def start(self) -> None:
-        await self.handle_incoming()
+        await self.run()
 
     @property
     def is_initiator(self) -> bool:
@@ -122,9 +136,12 @@ class Mplex(IMuxedConn):
             return
         # Set the `event_shutting_down`, to allow graceful shutdown.
         self.event_shutting_down.set()
-        await self.secured_conn.close()
-        # Blocked until `close` is finally set.
-        await self.event_closed.wait()
+        if hasattr(self, "_manager") and self.manager.is_running:
+            await self.manager.stop()
+        else:
+            await self.secured_conn.close()
+            # Blocked until `close` is finally set.
+            await self.event_closed.wait()
 
     @property
     def is_closed(self) -> bool:
@@ -212,22 +229,6 @@ class Mplex(IMuxedConn):
             raise MplexUnavailable(
                 "failed to write message to the underlying connection"
             ) from e
-
-    async def handle_incoming(self) -> None:
-        """
-        Read a message off of the secured connection and add it to the
-        corresponding message buffer.
-        """
-        self.event_started.set()
-        while True:
-            try:
-                await self._handle_incoming_message()
-            except MplexUnavailable as e:
-                logger.debug("mplex unavailable while waiting for incoming: %s", e)
-                break
-        # If we enter here, it means this connection is shutting down.
-        # We should clean things up.
-        await self._cleanup()
 
     async def read_message(self) -> tuple[int, int, bytes]:
         """
