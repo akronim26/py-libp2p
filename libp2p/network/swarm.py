@@ -42,6 +42,7 @@ from libp2p.rcmgr.manager import ResourceManager
 from libp2p.security.pnet.protector import new_protected_conn
 from libp2p.tools.async_service import (
     Service,
+    ServiceAPI,
 )
 from libp2p.transport.exceptions import (
     MuxerUpgradeFailure,
@@ -906,7 +907,10 @@ class Swarm(Service, INetworkService):
         logger.debug(
             f"Swarm::add_conn | muxed_conn type: {muxed_type}, peer_id: {muxed_peer_id}"
         )
-        self.manager.run_task(muxed_conn.start)
+        if isinstance(muxed_conn, ServiceAPI):
+            self.manager.run_daemon_child_service(muxed_conn)
+        else:
+            self.manager.run_task(muxed_conn.start)
         logger.debug(
             f"Swarm::add_conn | waiting for event_started for peer {muxed_conn.peer_id}"
         )
@@ -919,7 +923,7 @@ class Swarm(Service, INetworkService):
             if not muxed_conn.is_established:
                 await muxed_conn._connected_event.wait()
         logger.debug("Swarm::add_conn | starting swarm connection")
-        self.manager.run_task(swarm_conn.start)
+        self.manager.run_child_service(swarm_conn)
         await swarm_conn.event_started.wait()
 
         # Add to connections dict with deduplication
