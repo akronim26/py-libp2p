@@ -20,6 +20,9 @@ from libp2p.rcmgr import Direction
 from libp2p.stream_muxer.exceptions import (
     MuxedConnUnavailable,
 )
+from libp2p.tools.async_service import (
+    Service,
+)
 
 if TYPE_CHECKING:
     from libp2p.network.swarm import Swarm  # noqa: F401
@@ -31,7 +34,7 @@ Reference: https://github.com/libp2p/go-libp2p-swarm/blob/
 """
 
 
-class SwarmConn(INetConn):
+class SwarmConn(Service, INetConn):
     muxed_conn: IMuxedConn
     swarm: "Swarm"
     streams: set[NetStream]
@@ -115,6 +118,10 @@ class SwarmConn(INetConn):
                 self._resource_scope = None
 
         # Close the muxed connection
+        if hasattr(self, "_manager") and self.manager.is_running:
+            await self.manager.stop()
+            return
+
         try:
             await self.muxed_conn.close()
         except Exception as e:
@@ -152,19 +159,6 @@ class SwarmConn(INetConn):
         # Notify all listeners about the disconnection
         logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
         await self._notify_disconnected()
-
-    async def _handle_new_streams(self) -> None:
-        self.event_started.set()
-        async with trio.open_nursery() as nursery:
-            while True:
-                try:
-                    stream = await self.muxed_conn.accept_stream()
-                except MuxedConnUnavailable:
-                    await self.close()
-                    break
-                # Asynchronously handle the accepted stream, to avoid blocking
-                # the next stream.
-                nursery.start_soon(self._handle_muxed_stream, stream)
 
     async def _handle_muxed_stream(self, muxed_stream: IMuxedStream) -> None:
         # Acquire inbound stream resource if a manager is configured
@@ -217,12 +211,28 @@ class SwarmConn(INetConn):
     async def _notify_disconnected(self) -> None:
         await self.swarm.notify_disconnected(self)
 
-    async def start(self) -> None:
+    async def run(self) -> None:
         streams_open = self.get_streams()
         for stream in streams_open:
             """Set the state of the stream to OPEN."""
             await stream.set_state(StreamState.OPEN)
-        await self._handle_new_streams()
+
+        self.event_started.set()
+        try:
+            while True:
+                try:
+                    stream = await self.muxed_conn.accept_stream()
+                except MuxedConnUnavailable:
+                    break
+                # Asynchronously handle the accepted stream, to avoid blocking
+                # the next stream.
+                self.manager.run_task(self._handle_muxed_stream, stream)
+            await self.manager.wait_finished()
+        finally:
+            await self._cleanup()
+
+    async def start(self) -> None:
+        await self.run()
 
     async def new_stream(self) -> NetStream:
         muxed_stream = await self.muxed_conn.open_stream()
