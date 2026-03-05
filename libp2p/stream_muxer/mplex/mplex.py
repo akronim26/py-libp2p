@@ -77,6 +77,7 @@ class Mplex(IMuxedConn):
     event_closed: trio.Event
     event_started: trio.Event
     on_close: Callable[[], Awaitable[Any]] | None
+    _cancel_scope: trio.CancelScope
 
     def __init__(
         self,
@@ -108,6 +109,7 @@ class Mplex(IMuxedConn):
         self.event_closed = trio.Event()
         self.event_started = trio.Event()
         self.on_close = on_close
+        self._cancel_scope = trio.CancelScope()
 
     async def start(self) -> None:
         await self.handle_incoming()
@@ -124,6 +126,8 @@ class Mplex(IMuxedConn):
             return
         # Set the `event_shutting_down`, to allow graceful shutdown.
         self.event_shutting_down.set()
+        # Cancel the handle_incoming loop deterministically.
+        self._cancel_scope.cancel()
         await self.secured_conn.close()
         # Blocked until `close` is finally set.
         await self.event_closed.wait()
@@ -221,15 +225,22 @@ class Mplex(IMuxedConn):
         corresponding message buffer.
         """
         self.event_started.set()
-        while True:
-            try:
-                await self._handle_incoming_message()
-            except MplexUnavailable as e:
-                logger.debug("mplex unavailable while waiting for incoming: %s", e)
-                break
-        # If we enter here, it means this connection is shutting down.
-        # We should clean things up.
-        await self._cleanup()
+        try:
+            with self._cancel_scope:
+                while True:
+                    try:
+                        await self._handle_incoming_message()
+                    except MplexUnavailable as e:
+                        logger.debug(
+                            "mplex unavailable while waiting for incoming: %s",
+                            e,
+                        )
+                        break
+        finally:
+            # Whether we exited via cancellation or natural I/O error,
+            # always clean up. Shield from cancellation to ensure it completes.
+            with trio.CancelScope(shield=True):
+                await self._cleanup()
 
     async def read_message(self) -> tuple[int, int, bytes]:
         """
