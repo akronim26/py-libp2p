@@ -50,6 +50,7 @@ from libp2p.peer.peerstore import (
 from libp2p.rcmgr.manager import ResourceManager
 from libp2p.security.pnet.protector import new_protected_conn
 from libp2p.tools.async_service import (
+    LifecycleError,
     Service,
 )
 from libp2p.transport.exceptions import (
@@ -136,8 +137,10 @@ class Swarm(Service, INetworkService):
         self.connection_config = connection_config or ConnectionConfig()
 
         # Enhanced: Initialize connections as 1:many mapping
-        self.connections = {}
-        self.listeners = dict()
+        self.connections: dict[ID, list[INetConn]] = {}
+        # Stores CancelScopes for tasks spawned per connection
+        self._conn_task_scopes: dict[ID, list[trio.CancelScope]] = {}
+        self.listeners: dict[str, IListener] = {}
 
         # Create Notifee array
         self.notifees = []
@@ -1424,8 +1427,10 @@ class Swarm(Service, INetworkService):
             # we would track individual streams and release them specifically
             logger.debug("Releasing stream resources for peer %s", peer_id)
 
-        # Remove from connections dict
-        self.connections.pop(peer_id, None)
+        # Clear task scopes for this peer
+        scopes = self._conn_task_scopes.pop(peer_id, [])
+        for scope in scopes:
+            scope.cancel()
 
         logger.debug("successfully close the connection to peer %s", peer_id)
 
@@ -1447,12 +1452,12 @@ class Swarm(Service, INetworkService):
         """
         # Apply resource manager checks to ALL connection types (TCP, WebSocket, QUIC)
         conn_scope = None
+        peer_id = muxed_conn.peer_id
         if self._resource_manager is not None:
             try:
                 # Extract peer_id from any muxed connection type
-                peer_id_for_scope = muxed_conn.peer_id
                 conn_scope = self._resource_manager.open_connection(
-                    peer_id=peer_id_for_scope,
+                    peer_id=peer_id,
                 )
                 if conn_scope is None:
                     # Resource manager denied the connection.
@@ -1508,15 +1513,31 @@ class Swarm(Service, INetworkService):
         # For non-QUIC connections, set the resource scope on SwarmConn
         if conn_scope is not None and not hasattr(muxed_conn, "set_resource_scope"):
             swarm_conn.set_resource_scope(conn_scope)  # type: ignore
+
+        if peer_id not in self._conn_task_scopes:
+            self._conn_task_scopes[peer_id] = []
+
+        async def _run_muxed_with_scope(peer: ID) -> None:
+            with trio.CancelScope() as scope:
+                if peer in self._conn_task_scopes:
+                    self._conn_task_scopes[peer].append(scope)
+                await muxed_conn.start()
+
+        async def _run_swarm_with_scope(peer: ID) -> None:
+            with trio.CancelScope() as scope:
+                if peer in self._conn_task_scopes:
+                    self._conn_task_scopes[peer].append(scope)
+                await swarm_conn.start()
+
         logger.debug("Swarm::add_conn | starting muxed connection")
-        self.manager.run_task(muxed_conn.start)
+        self._run_task(_run_muxed_with_scope, peer_id)
         await muxed_conn.event_started.wait()
         # For QUIC connections, also verify connection is established
         if isinstance(muxed_conn, QUICConnection):
             if not muxed_conn.is_established:
                 await muxed_conn._connected_event.wait()
         logger.debug("Swarm::add_conn | starting swarm connection")
-        self.manager.run_task(swarm_conn.start)
+        self._run_task(_run_swarm_with_scope, peer_id)
         await swarm_conn.event_started.wait()
 
         # Add to connections dict with deduplication
@@ -1616,11 +1637,17 @@ class Swarm(Service, INetworkService):
 
         for conn in connections_to_remove:
             logger.debug(f"Trimming old connection for peer {peer_id}")
-            trio.lowlevel.spawn_system_task(self._close_connection_async, conn)
+            self._run_task(self._close_connection_async, conn)
 
         # Keep only the most recent connections
         max_conns = self.connection_config.max_connections_per_peer
         self.connections[peer_id] = connections[-max_conns:]
+
+    def _run_task(self, async_fn: Callable[..., Awaitable[Any]], *args: Any) -> None:
+        try:
+            self.manager.run_task(async_fn, *args)
+        except (AttributeError, LifecycleError):
+            trio.lowlevel.spawn_system_task(async_fn, *args)
 
     async def _close_connection_async(self, connection: INetConn) -> None:
         """Close a connection asynchronously."""

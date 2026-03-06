@@ -1,0 +1,18 @@
+check yaml...............................................................Passed
+check toml...............................................................Passed
+fix end of files.........................................................Passed
+trim trailing whitespace.................................................Passed
+pyupgrade................................................................Passed
+ruff (legacy alias)......................................................Passed
+ruff format..............................................................Passed
+mdformat.................................................................Passed
+run mypy with all dev dependencies present...............................Passed
+run pyrefly typecheck locally............................................Failed
+- hook id: pyrefly-local
+- exit code: 1
+
+INFO Checking project configured at `/home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/pyproject.toml`
+Pattern /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/examples is matched by `project-excludes` or ignore file.
+`project-excludes`: [/home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/**/.project-template/**/*, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/**/docs/conf.py, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/**/*pb2.py, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/**/*.pyi, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/.venv/**/*, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/tests/interop/nim_libp2p, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/tests, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/examples, **/node_modules, **/__pycache__, **/venv/**/*, **/.[!/.]*/**/*, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/venv/lib/python3.12/site-packages, __editable__.libp2p-0.6.0.finder.__path_hook__], ignore files [/home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/.gitignore, /home/akronim26/Desktop/Skills/Blockchain/Opensource/py-libp2p/.git/info/exclude]
+
+Check for .rst files in the top-level directory..........................Passed

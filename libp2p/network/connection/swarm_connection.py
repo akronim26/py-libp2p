@@ -42,6 +42,8 @@ class SwarmConn(INetConn):
     _direction: Direction
     _actual_transport_addresses: list[Multiaddr] | None
     _connection_type: ConnectionType
+    _cancel_scope: trio.CancelScope
+    _event_streams_handler_finished: trio.Event
 
     def __init__(
         self,
@@ -65,6 +67,9 @@ class SwarmConn(INetConn):
             self._direction = Direction.from_string(str(direction))
         self._actual_transport_addresses = None
         self._connection_type = ConnectionType.UNKNOWN
+        self._cancel_scope = trio.CancelScope()
+        self._event_streams_handler_finished = trio.Event()
+
         # Provide back-references/hooks expected by NetStream
         try:
             setattr(self.muxed_conn, "swarm", self.swarm)
@@ -143,42 +148,46 @@ class SwarmConn(INetConn):
         logging.debug(f"Closing SwarmConn for peer {self.muxed_conn.peer_id}")
         self.event_closed.set()
 
-        # Clean up resource scope if it exists
-        if self._resource_scope is not None:
+        # Cancel the _handle_new_streams loop deterministically.
+        self._cancel_scope.cancel()
+
+        with trio.CancelScope(shield=True):
+            # Wait for _handle_new_streams to fully finish before cleanup.
+            await self._event_streams_handler_finished.wait()
+
+            # Clean up resource scope if it exists
+            if self._resource_scope is not None:
+                try:
+                    import inspect
+
+                    if hasattr(self._resource_scope, "close"):
+                        close_method = getattr(self._resource_scope, "close")
+                        if inspect.iscoroutinefunction(close_method):
+                            await close_method()
+                        else:
+                            close_method()
+                    elif hasattr(self._resource_scope, "release"):
+                        release_method = getattr(self._resource_scope, "release")
+                        if inspect.iscoroutinefunction(release_method):
+                            await release_method()
+                        else:
+                            release_method()
+                    logging.debug(
+                        f"Released resource scope for peer {self.muxed_conn.peer_id}"
+                    )
+                except Exception as e:
+                    logging.warning(f"Error releasing resource scope: {e}")
+                finally:
+                    self._resource_scope = None
+
+            # Close the muxed connection
             try:
-                # Release the resource scope
-                import inspect
-
-                if hasattr(self._resource_scope, "close"):
-                    close_method = getattr(self._resource_scope, "close")
-                    # Check if close() is a coroutine
-                    if inspect.iscoroutinefunction(close_method):
-                        await close_method()
-                    else:
-                        # Synchronous close
-                        close_method()
-                elif hasattr(self._resource_scope, "release"):
-                    release_method = getattr(self._resource_scope, "release")
-                    if inspect.iscoroutinefunction(release_method):
-                        await release_method()
-                    else:
-                        release_method()
-                logging.debug(
-                    f"Released resource scope for peer {self.muxed_conn.peer_id}"
-                )
+                await self.muxed_conn.close()
             except Exception as e:
-                logging.warning(f"Error releasing resource scope: {e}")
-            finally:
-                self._resource_scope = None
+                logging.warning(f"Error while closing muxed connection: {e}")
 
-        # Close the muxed connection
-        try:
-            await self.muxed_conn.close()
-        except Exception as e:
-            logging.warning(f"Error while closing muxed connection: {e}")
-
-        # Perform proper cleanup of resources
-        await self._cleanup()
+            # Perform proper cleanup of resources
+            await self._cleanup()
 
     async def _cleanup(self) -> None:
         # Remove the connection from swarm
@@ -186,15 +195,13 @@ class SwarmConn(INetConn):
         self.swarm.remove_conn(self)
 
         # Only close the connection if it's not already closed
-        # Be defensive here to avoid exceptions during cleanup
         try:
             if not self.muxed_conn.is_closed:
                 await self.muxed_conn.close()
         except Exception as e:
             logging.warning(f"Error closing muxed connection: {e}")
 
-        # This is just for cleaning up state. The connection has already been closed.
-        # We *could* optimize this but it really isn't worth it.
+        # Reset all active streams
         logging.debug(f"Resetting streams for peer {self.muxed_conn.peer_id}")
         for stream in self.streams.copy():
             try:
@@ -202,26 +209,27 @@ class SwarmConn(INetConn):
             except Exception as e:
                 logging.warning(f"Error resetting stream: {e}")
 
-        # Force context switch for stream handlers to process the stream reset event we
-        # just emit before we cancel the stream handler tasks.
-        await trio.sleep(0.1)
-
         # Notify all listeners about the disconnection
         logging.debug(f"Notifying disconnection for peer {self.muxed_conn.peer_id}")
         await self._notify_disconnected()
 
     async def _handle_new_streams(self) -> None:
         self.event_started.set()
-        async with trio.open_nursery() as nursery:
-            while True:
-                try:
-                    stream = await self.muxed_conn.accept_stream()
-                except MuxedConnUnavailable:
-                    await self.close()
-                    break
-                # Asynchronously handle the accepted stream, to avoid blocking
-                # the next stream.
-                nursery.start_soon(self._handle_muxed_stream, stream)
+        try:
+            with self._cancel_scope:
+                async with trio.open_nursery() as nursery:
+                    while True:
+                        try:
+                            stream = await self.muxed_conn.accept_stream()
+                        except MuxedConnUnavailable:
+                            break
+                        nursery.start_soon(self._handle_muxed_stream, stream)
+        finally:
+            # Signal that this handler has fully wound down (nursery included).
+            # close() awaits this before proceeding to _cleanup().
+            self._event_streams_handler_finished.set()
+            with trio.CancelScope(shield=True):
+                await self.close()
 
     async def _handle_muxed_stream(self, muxed_stream: IMuxedStream) -> None:
         # Acquire inbound stream resource if a manager is configured
@@ -249,9 +257,10 @@ class SwarmConn(INetConn):
         try:
             await self.swarm.common_stream_handler(net_stream)
         finally:
-            # Always remove the stream when the handler finishes
-            # Use simple remove_stream since stream handles notifications itself
-            self.remove_stream(net_stream)
+            # Always remove the stream when the handler finishes.
+            # Use shielded async remove for proper notification even during cancellation
+            with trio.CancelScope(shield=True):
+                await net_stream.remove()
             # Release inbound stream resource
             if rm is not None and acquired:
                 try:
